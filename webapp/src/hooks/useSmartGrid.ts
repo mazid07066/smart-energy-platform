@@ -21,6 +21,8 @@ import type {
   TrainingMetrics,
 } from "@/lib/types";
 
+const DEVICE_STALE_AFTER_MS = 30_000;
+
 const defaultCommands: Commands = {
   automaticMode: true,
   relay1: true,
@@ -28,6 +30,29 @@ const defaultCommands: Commands = {
   resetAlarm: false,
   commandId: 0,
 };
+
+/**
+ * Firebase server timestamps use epoch milliseconds.
+ * This helper also accepts epoch seconds in case an Arduino record was
+ * accidentally written using seconds.
+ */
+function normalizeTimestampMs(value?: number): number | null {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value <= 0
+  ) {
+    return null;
+  }
+
+  // Epoch timestamps before approximately 2001 when interpreted as
+  // milliseconds are probably epoch seconds.
+  if (value < 1_000_000_000_000) {
+    return value * 1000;
+  }
+
+  return value;
+}
 
 export function useSmartGrid() {
   const [live, setLive] = useState<LiveData>({});
@@ -42,12 +67,13 @@ export function useSmartGrid() {
   const [training, setTraining] = useState<TrainingMetrics>({});
 
   const [firebaseConnected, setFirebaseConnected] = useState(false);
-  const [lastError, setLastError] = useState<string | null>(null);
+  const [firebaseServerOffsetMs, setFirebaseServerOffsetMs] =
+    useState(0);
 
-  /*
-   * Use a lazy initializer so Date.now() is not called directly
-   * during the component render expression.
-   */
+  const [lastLiveReceivedAtMs, setLastLiveReceivedAtMs] =
+    useState<number | null>(null);
+
+  const [lastError, setLastError] = useState<string | null>(null);
   const [clock, setClock] = useState(() => Date.now());
 
   useEffect(() => {
@@ -65,133 +91,195 @@ export function useSmartGrid() {
       setLastError(error.message);
     };
 
-    const unsubscribers = [
-      onValue(
-        ref(database, ".info/connected"),
-        (snapshot) => {
-          setFirebaseConnected(snapshot.val() === true);
-        },
-        onError,
+    const unsubscribeConnected = onValue(
+      ref(database, ".info/connected"),
+      (snapshot) => {
+        setFirebaseConnected(snapshot.val() === true);
+      },
+      onError,
+    );
+
+    const unsubscribeServerOffset = onValue(
+      ref(database, ".info/serverTimeOffset"),
+      (snapshot) => {
+        const value = snapshot.val();
+
+        setFirebaseServerOffsetMs(
+          typeof value === "number" &&
+            Number.isFinite(value)
+            ? value
+            : 0,
+        );
+      },
+      onError,
+    );
+
+    const unsubscribeLive = onValue(
+      ref(database, "smartGrid/live"),
+      (snapshot) => {
+        setLive((snapshot.val() ?? {}) as LiveData);
+
+        /*
+         * This time records when the browser actually received a live
+         * Firebase event. It protects against Arduino/browser clock
+         * differences while still becoming stale when updates stop.
+         */
+        setLastLiveReceivedAtMs(Date.now());
+      },
+      onError,
+    );
+
+    const unsubscribeHistory = onValue(
+      query(
+        ref(database, "smartGrid/history"),
+        limitToLast(500),
       ),
+      (snapshot) => {
+        const value = snapshot.val() as
+          | Record<string, LiveData>
+          | null;
 
-      onValue(
-        ref(database, "smartGrid/live"),
-        (snapshot) => {
-          setLive((snapshot.val() ?? {}) as LiveData);
-        },
-        onError,
-      ),
+        if (!value) {
+          setHistory([]);
+          return;
+        }
 
-      onValue(
-        query(
-          ref(database, "smartGrid/history"),
-          limitToLast(500),
-        ),
-        (snapshot) => {
-          const value = snapshot.val() as
-            | Record<string, LiveData>
-            | null;
-
-          if (!value) {
-            setHistory([]);
-            return;
-          }
-
-          const points: HistoryPoint[] = Object.entries(value)
-            .map(([id, item]) => ({
-              id,
-              ...item,
-              timeLabel: item.serverTimestamp
-                ? new Date(
-                    item.serverTimestamp,
-                  ).toLocaleTimeString()
-                : id.slice(-8),
-            }))
-            .sort(
-              (first, second) =>
-                (first.serverTimestamp ?? 0) -
-                (second.serverTimestamp ?? 0),
+        const points: HistoryPoint[] = Object.entries(value)
+          .map(([id, item]) => {
+            const timestampMs = normalizeTimestampMs(
+              item.serverTimestamp,
             );
 
-          setHistory(points);
-        },
-        onError,
-      ),
-
-      onValue(
-        ref(database, "smartGrid/commands"),
-        (snapshot) => {
-          setCommands({
-            ...defaultCommands,
-            ...((snapshot.val() ?? {}) as Partial<Commands>),
-          });
-        },
-        onError,
-      ),
-
-      onValue(
-        ref(database, "smartGrid/acknowledgement"),
-        (snapshot) => {
-          setAcknowledgement(
-            (snapshot.val() ?? {}) as Acknowledgement,
+            return {
+              id,
+              ...item,
+              serverTimestamp:
+                timestampMs ?? item.serverTimestamp,
+              timeLabel: timestampMs
+                ? new Date(timestampMs).toLocaleTimeString()
+                : id.slice(-8),
+            };
+          })
+          .sort(
+            (first, second) =>
+              (first.serverTimestamp ?? 0) -
+              (second.serverTimestamp ?? 0),
           );
-        },
-        onError,
-      ),
 
-      onValue(
-        ref(database, "smartGrid/datasetLabels"),
-        (snapshot) => {
-          const raw = snapshot.val() as
-            | Record<string, { label?: EventLabel }>
-            | null;
+        setHistory(points);
+      },
+      onError,
+    );
 
-          const nextLabels: Record<string, EventLabel> = {};
+    const unsubscribeCommands = onValue(
+      ref(database, "smartGrid/commands"),
+      (snapshot) => {
+        setCommands({
+          ...defaultCommands,
+          ...((snapshot.val() ?? {}) as Partial<Commands>),
+        });
+      },
+      onError,
+    );
 
-          Object.entries(raw ?? {}).forEach(([id, item]) => {
-            if (item.label) {
-              nextLabels[id] = item.label;
-            }
-          });
+    const unsubscribeAcknowledgement = onValue(
+      ref(database, "smartGrid/acknowledgement"),
+      (snapshot) => {
+        setAcknowledgement(
+          (snapshot.val() ?? {}) as Acknowledgement,
+        );
+      },
+      onError,
+    );
 
-          setLabels(nextLabels);
-        },
-        onError,
-      ),
+    const unsubscribeLabels = onValue(
+      ref(database, "smartGrid/datasetLabels"),
+      (snapshot) => {
+        const raw = snapshot.val() as
+          | Record<string, { label?: EventLabel }>
+          | null;
 
-      onValue(
-        ref(database, "smartGrid/ml/latest"),
-        (snapshot) => {
-          setMlLatest((snapshot.val() ?? {}) as MlOutput);
-        },
-        onError,
-      ),
+        const nextLabels: Record<string, EventLabel> = {};
 
-      onValue(
-        ref(database, "smartGrid/ml/training"),
-        (snapshot) => {
-          setTraining(
-            (snapshot.val() ?? {}) as TrainingMetrics,
-          );
-        },
-        onError,
-      ),
-    ];
+        Object.entries(raw ?? {}).forEach(([id, item]) => {
+          if (item.label) {
+            nextLabels[id] = item.label;
+          }
+        });
+
+        setLabels(nextLabels);
+      },
+      onError,
+    );
+
+    const unsubscribeMlLatest = onValue(
+      ref(database, "smartGrid/ml/latest"),
+      (snapshot) => {
+        setMlLatest((snapshot.val() ?? {}) as MlOutput);
+      },
+      onError,
+    );
+
+    const unsubscribeTraining = onValue(
+      ref(database, "smartGrid/ml/training"),
+      (snapshot) => {
+        setTraining(
+          (snapshot.val() ?? {}) as TrainingMetrics,
+        );
+      },
+      onError,
+    );
 
     return () => {
-      unsubscribers.forEach((unsubscribe) => {
-        unsubscribe();
-      });
+      unsubscribeConnected();
+      unsubscribeServerOffset();
+      unsubscribeLive();
+      unsubscribeHistory();
+      unsubscribeCommands();
+      unsubscribeAcknowledgement();
+      unsubscribeLabels();
+      unsubscribeMlLatest();
+      unsubscribeTraining();
     };
   }, []);
 
-  const isDeviceOnline = useMemo(() => {
-    if (!live.deviceOnline || !live.serverTimestamp) {
-      return false;
-    }
+  const normalizedLiveTimestampMs = useMemo(
+    () => normalizeTimestampMs(live.serverTimestamp),
+    [live.serverTimestamp],
+  );
 
-    return clock - live.serverTimestamp < 30_000;
-  }, [clock, live.deviceOnline, live.serverTimestamp]);
+  const firebaseAdjustedNowMs =
+    clock + firebaseServerOffsetMs;
+
+  const timestampAgeMs = normalizedLiveTimestampMs
+    ? Math.max(
+        0,
+        firebaseAdjustedNowMs - normalizedLiveTimestampMs,
+      )
+    : null;
+
+  const receiveAgeMs = lastLiveReceivedAtMs
+    ? Math.max(0, clock - lastLiveReceivedAtMs)
+    : null;
+
+  const timestampIsFresh =
+    timestampAgeMs !== null &&
+    timestampAgeMs < DEVICE_STALE_AFTER_MS;
+
+  const firebaseStreamIsFresh =
+    receiveAgeMs !== null &&
+    receiveAgeMs < DEVICE_STALE_AFTER_MS;
+
+  /*
+   * A fresh timestamp or a recently received Firebase live update is
+   * enough to show the device online.
+   *
+   * deviceOnline remains useful as diagnostic information, but it no
+   * longer incorrectly overrides clear evidence of fresh updates.
+   */
+  const isDeviceOnline =
+    firebaseConnected &&
+    (timestampIsFresh || firebaseStreamIsFresh);
 
   const sendCommand = useCallback(
     async (
@@ -223,11 +311,9 @@ export function useSmartGrid() {
   );
 
   const resetAlarm = useCallback(async (): Promise<void> => {
-    const commandId = Date.now();
-
     await update(ref(database, "smartGrid/commands"), {
       resetAlarm: true,
-      commandId,
+      commandId: Date.now(),
     });
 
     window.setTimeout(() => {
@@ -235,7 +321,10 @@ export function useSmartGrid() {
         resetAlarm: false,
         commandId: Date.now(),
       }).catch((error: unknown) => {
-        console.error("Alarm reset release failed:", error);
+        console.error(
+          "Alarm reset release failed:",
+          error,
+        );
       });
     }, 1500);
   }, []);
@@ -261,8 +350,13 @@ export function useSmartGrid() {
 
   const trainModel = useCallback(async (): Promise<unknown> => {
     const apiUrl =
-      process.env.NEXT_PUBLIC_ML_API_URL ??
-      "http://127.0.0.1:8000";
+      process.env.NEXT_PUBLIC_ML_API_URL?.trim();
+
+    if (!apiUrl) {
+      throw new Error(
+        "The public ML API URL is not configured.",
+      );
+    }
 
     const response = await fetch(`${apiUrl}/train`, {
       method: "POST",
@@ -286,8 +380,13 @@ export function useSmartGrid() {
   const predictLatest =
     useCallback(async (): Promise<unknown> => {
       const apiUrl =
-        process.env.NEXT_PUBLIC_ML_API_URL ??
-        "http://127.0.0.1:8000";
+        process.env.NEXT_PUBLIC_ML_API_URL?.trim();
+
+      if (!apiUrl) {
+        throw new Error(
+          "The public ML API URL is not configured.",
+        );
+      }
 
       const response = await fetch(
         `${apiUrl}/predict/latest`,
@@ -312,7 +411,12 @@ export function useSmartGrid() {
     }, []);
 
   return {
-    live,
+    live: {
+      ...live,
+      serverTimestamp:
+        normalizedLiveTimestampMs ??
+        live.serverTimestamp,
+    },
     history,
     commands,
     acknowledgement,
@@ -320,6 +424,10 @@ export function useSmartGrid() {
     mlLatest,
     training,
     firebaseConnected,
+    firebaseServerOffsetMs,
+    lastLiveReceivedAtMs,
+    timestampAgeMs,
+    receiveAgeMs,
     isDeviceOnline,
     lastError,
     sendCommand,
