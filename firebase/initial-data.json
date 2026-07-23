@@ -1,0 +1,34 @@
+{
+  "smartGrid": {
+    "commands": {
+      "automaticMode": true,
+      "relay1": true,
+      "relay2": true,
+      "resetAlarm": false,
+      "commandId": 0
+    },
+    "acknowledgement": {
+      "status": "WAITING",
+      "commandId": 0
+    },
+    "ml": {
+      "latest": {
+        "classification": "WAITING",
+        "classificationConfidence": 0,
+        "forecast15Seconds_mA": 0,
+        "forecast1Minute_mA": 0,
+        "forecast5Minutes_mA": 0,
+        "recommendation": "Collect data and train the models."
+      },
+      "training": {
+        "status": "NOT_TRAINED"
+      }
+    },
+    "system": {
+      "projectName": "IoT-Based Smart Energy Demand Forecasting & Theft Detection System",
+      "currentUnit": "mA",
+      "voltageUnit": "V",
+      "powerUnit": "W"
+    }
+  }
+}

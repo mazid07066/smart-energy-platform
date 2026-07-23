@@ -1,0 +1,87 @@
+# =========================================================
+# Smart Energy Platform
+# =========================================================
+
+# Environment and secret files
+.env
+.env.*
+!.env.example
+
+webapp/.env.local
+webapp/.env.development.local
+webapp/.env.production.local
+webapp/.env.test.local
+
+ml-service/.env
+
+# Firebase service-account files
+firebase-service-account*.json
+service-account*.json
+*firebase-adminsdk*.json
+smart-energy-service-account.json
+firebase-keys/
+
+# Node.js
+node_modules/
+webapp/node_modules/
+
+# Next.js
+.next/
+webapp/.next/
+out/
+webapp/out/
+
+# Build output
+dist/
+build/
+
+# npm logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ml-service/.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Trained model binaries
+ml-service/models/*.joblib
+ml-service/models/*.pkl
+ml-service/models/*.pickle
+
+# Generated model metadata
+ml-service/models/metadata.json
+ml-service/models/metrics.json
+
+# Preserve empty models folder
+!ml-service/models/.gitkeep
+
+# IDE files
+.vscode/
+.idea/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+
+# Local audit report
+npm-audit-report.txt
